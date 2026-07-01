@@ -1,0 +1,355 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include "driver/ledc.h"
+#include "driver/gpio.h"
+
+// ========== PIN DEFINITIONS ==========
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+#define FLASH_LED_PIN      4
+#define BUTTON_PIN        13
+
+const char* ssid     = "ESP32-CAM";
+const char* password = "12345678";
+
+WebServer controlServer(80);
+WiFiServer  streamServer(81);
+
+// ========== STATE ==========
+bool flashIsOn             = false;
+bool buttonPressed         = false;
+bool captureRequested      = false;
+int  imageCounter          = 0;
+
+bool lastButtonState       = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+bool stableButtonState     = HIGH;
+
+// ========== STREAM TASK — Core 0 ==========
+void streamTask(void* pvParameters) {
+  streamServer.begin();
+
+  while (true) {
+    WiFiClient client = streamServer.available();
+    if (!client) {
+      vTaskDelay(10 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    Serial.println("Stream client connected");
+    WiFi.setSleep(WIFI_PS_NONE);
+    client.setNoDelay(true);
+
+    unsigned long timeout = millis();
+    while (client.connected() && !client.available()) {
+      if (millis() - timeout > 3000) break;
+      vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      if (line == "\r") break;
+    }
+
+    client.print(
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+      "Access-Control-Allow-Origin: *\r\n"
+      "Cache-Control: no-cache\r\n"
+      "\r\n"
+    );
+
+    while (client.connected()) {
+      camera_fb_t* fb = esp_camera_fb_get();
+      if (!fb) { vTaskDelay(5 / portTICK_PERIOD_MS); continue; }
+
+      char header[80];
+      int hlen = snprintf(header, sizeof(header),
+        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+        fb->len
+      );
+      client.write((uint8_t*)header, hlen);
+      client.write(fb->buf, fb->len);
+      client.write((uint8_t*)"\r\n", 2);
+      esp_camera_fb_return(fb);
+      vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+
+    client.stop();
+    Serial.println("Stream client disconnected");
+    WiFi.setSleep(WIFI_PS_MIN_MODEM);
+  }
+}
+
+// ========== PHOTO ==========
+void handle_photo() {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    controlServer.send(500, "text/plain", "Camera failed!");
+    return;
+  }
+
+  imageCounter++;
+  char disposition[48];
+  snprintf(disposition, sizeof(disposition),
+    "attachment; filename=\"img_%04d.jpg\"", imageCounter);
+
+  controlServer.sendHeader("Content-Disposition", disposition);
+  controlServer.sendHeader("Access-Control-Allow-Origin", "*");
+  controlServer.sendHeader("Access-Control-Expose-Headers", "Content-Disposition");
+
+  // ✅ No flash blink — flash is 100% user controlled only
+
+  controlServer.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+  Serial.printf("✅ Photo sent: img_%04d.jpg\n", imageCounter);
+}
+
+// ========== CAPTURE FLAG ==========
+void handle_capture_flag() {
+  if (captureRequested) {
+    captureRequested = false;
+    controlServer.send(200, "text/plain", "1");
+  } else {
+    controlServer.send(200, "text/plain", "0");
+  }
+}
+
+// ========== BUTTON STATE ==========
+void handle_btn_state() {
+  controlServer.send(200, "text/plain", (stableButtonState == LOW) ? "1" : "0");
+}
+
+// ========== FLASH ==========
+void handle_flash_on() {
+  digitalWrite(FLASH_LED_PIN, LOW);   // ✅ LOW = ON on AI Thinker
+  flashIsOn = true;
+  Serial.println("Flash ON");
+  controlServer.send(200, "text/plain", "ON");
+}
+
+void handle_flash_off() {
+  digitalWrite(FLASH_LED_PIN, HIGH);  // ✅ HIGH = OFF on AI Thinker
+  flashIsOn = false;
+  Serial.println("Flash OFF");
+  controlServer.send(200, "text/plain", "OFF");
+}
+
+// ========== WEB PAGE ==========
+void handle_root() {
+  String html = F("<!DOCTYPE html><html><head>");
+  html += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
+  html += F("<style>");
+  html += F("body{font-family:Arial;text-align:center;background:#111;color:white;margin:0;padding:16px}");
+  html += F("h2{margin-bottom:4px}");
+  html += F("img{border-radius:8px;max-width:100%}");
+  html += F("button{padding:12px 20px;margin:5px;border-radius:8px;border:none;cursor:pointer;font-size:15px;font-weight:bold}");
+  html += F("#status{margin-top:12px;padding:10px;border-radius:8px;font-size:15px;display:none}");
+  html += F("#btnstate{display:inline-block;margin:6px auto;padding:6px 18px;border-radius:20px;font-size:13px}");
+  html += F("#fps{color:#888;font-size:12px;margin:2px}");
+  html += F(".success{background:#1a7a1a}.error{background:#7a1a1a}");
+  html += F(".pressed{background:#e6c200;color:#000}.released{background:#333;color:#aaa}");
+  html += F(".fon{background:#ffaa00;color:#000}.foff{background:#444;color:#aaa}");
+  html += F("</style></head><body>");
+
+  html += F("<h2>ESP32-CAM</h2>");
+  html += F("<div id='btnstate' class='released'>Button: IDLE</div><br>");
+  html += F("<img src='http://192.168.4.1:81' id='stream' width='320'><br>");
+  html += F("<p id='fps'>FPS: --</p>");
+  html += F("<button id='fbtn' class='foff' onclick='toggleFlash()'>Flash: OFF</button>");
+  html += F("<button style='background:#2196F3;color:#fff' id='capbtn' onclick='capturePhoto()'>Capture</button>");
+  html += F("<a id='dl' style='display:none'></a>");
+  html += F("<div id='status'></div>");
+
+  html += F("<script>");
+
+  html += F("var fOn=false;");
+  html += F("function toggleFlash(){");
+  html += F("  var b=document.getElementById('fbtn');");
+  html += F("  b.disabled=true;");
+  html += F("  if(fOn){");
+  html += F("    fetch('/flash_off').then(r=>r.text()).then(t=>{");
+  html += F("      b.disabled=false;");
+  html += F("      if(t==='OFF'){fOn=false;b.innerText='Flash: OFF';b.className='foff';}");
+  html += F("    }).catch(()=>{b.disabled=false;});");
+  html += F("  } else {");
+  html += F("    fetch('/flash_on').then(r=>r.text()).then(t=>{");
+  html += F("      b.disabled=false;");
+  html += F("      if(t==='ON'){fOn=true;b.innerText='Flash: ON';b.className='fon';}");
+  html += F("    }).catch(()=>{b.disabled=false;});");
+  html += F("  }");
+  html += F("}");
+
+  html += F("function capturePhoto(){");
+  html += F("  var b=document.getElementById('capbtn');");
+  html += F("  b.disabled=true;b.innerText='Saving...';");
+  html += F("  fetch('/photo')");
+  html += F("  .then(r=>{");
+  html += F("    if(!r.ok)throw new Error('fail');");
+  html += F("    var cd=r.headers.get('Content-Disposition')||'';");
+  html += F("    var m=cd.match(/filename=\"(.+?)\"/);");
+  html += F("    var name=m?m[1]:'capture.jpg';");
+  html += F("    return r.blob().then(blob=>({blob,name}));");
+  html += F("  })");
+  html += F("  .then(({blob,name})=>{");
+  html += F("    var url=URL.createObjectURL(blob);");
+  html += F("    var a=document.getElementById('dl');");
+  html += F("    a.href=url;a.download=name;a.click();");
+  html += F("    URL.revokeObjectURL(url);");
+  html += F("    showStatus('Downloaded: '+name,'success');");
+  html += F("    b.disabled=false;b.innerText='Capture';");
+  html += F("  })");
+  html += F("  .catch(()=>{");
+  html += F("    showStatus('Capture failed!','error');");
+  html += F("    b.disabled=false;b.innerText='Capture';");
+  html += F("  });");
+  html += F("}");
+
+  html += F("function showStatus(msg,type){");
+  html += F("  var s=document.getElementById('status');");
+  html += F("  s.innerText=msg;s.className=type;s.style.display='block';");
+  html += F("  setTimeout(()=>{s.style.display='none';},3000);");
+  html += F("}");
+
+  html += F("var fc=0,fl=Date.now();");
+  html += F("document.getElementById('stream').onload=function(){");
+  html += F("  fc++;var now=Date.now();");
+  html += F("  if(now-fl>=1000){document.getElementById('fps').innerText='FPS: '+fc;fc=0;fl=now;}");
+  html += F("};");
+
+  html += F("setInterval(function(){");
+  html += F("  fetch('/btn_state').then(r=>r.text()).then(s=>{");
+  html += F("    var d=document.getElementById('btnstate');");
+  html += F("    if(s==='1'){d.className='pressed';d.innerText='Button: PRESSED';}");
+  html += F("    else{d.className='released';d.innerText='Button: IDLE';}");
+  html += F("  }).catch(()=>{});");
+  html += F("},200);");
+
+  html += F("setInterval(function(){");
+  html += F("  fetch('/capture_flag').then(r=>r.text()).then(f=>{");
+  html += F("    if(f==='1')capturePhoto();");
+  html += F("  }).catch(()=>{});");
+  html += F("},300);");
+
+  html += F("</script></body></html>");
+  controlServer.send(200, "text/html", html);
+}
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n===== BOOT =====");
+
+  // ✅ Force flash OFF using low-level driver — fires before Arduino layer
+  // Prevents the brief flash glitch at boot
+  gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+  gpio_set_level(GPIO_NUM_4, 1);  // 1 = HIGH = OFF on AI Thinker
+
+  // Button
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  delay(100);  // let pin settle before reading
+
+  lastButtonState   = digitalRead(BUTTON_PIN);
+  stableButtonState = lastButtonState;
+  buttonPressed     = false;  // ✅ never assume pressed at boot
+
+  Serial.printf("GPIO13 at boot: %d %s\n",
+    lastButtonState,
+    lastButtonState == HIGH ? "(HIGH = idle, OK)" : "(LOW = check wiring!)"
+  );
+
+  // Camera
+  camera_config_t config;
+  config.ledc_channel  = LEDC_CHANNEL_0;
+  config.ledc_timer    = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk      = XCLK_GPIO_NUM;
+  config.pin_pclk      = PCLK_GPIO_NUM;
+  config.pin_vsync     = VSYNC_GPIO_NUM;
+  config.pin_href      = HREF_GPIO_NUM;
+  config.pin_sccb_sda  = SIOD_GPIO_NUM;
+  config.pin_sccb_scl  = SIOC_GPIO_NUM;
+  config.pin_pwdn      = PWDN_GPIO_NUM;
+  config.pin_reset     = RESET_GPIO_NUM;
+  config.xclk_freq_hz  = 20000000;
+  config.pixel_format  = PIXFORMAT_JPEG;
+  config.frame_size    = FRAMESIZE_QVGA;
+  config.jpeg_quality  = 12;
+  config.fb_count      = 2;
+
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("❌ Camera init failed"); return;
+  }
+  Serial.println("✅ Camera ready");
+
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_vflip(s, 1);
+  s->set_quality(s, 12);
+  s->set_gainceiling(s, GAINCEILING_4X);
+
+  // ✅ Re-assert flash OFF after camera init
+  // Camera init can disturb GPIO4 briefly
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, HIGH);
+
+  WiFi.softAP(ssid, password);
+  Serial.print("✅ IP: "); Serial.println(WiFi.softAPIP());
+  WiFi.setSleep(WIFI_PS_MIN_MODEM);
+
+  controlServer.on("/",             handle_root);
+  controlServer.on("/photo",        HTTP_GET, handle_photo);
+  controlServer.on("/capture_flag", HTTP_GET, handle_capture_flag);
+  controlServer.on("/btn_state",    HTTP_GET, handle_btn_state);
+  controlServer.on("/flash_on",     HTTP_GET, handle_flash_on);
+  controlServer.on("/flash_off",    HTTP_GET, handle_flash_off);
+  controlServer.begin();
+  Serial.println("✅ Control server port 80");
+
+  xTaskCreatePinnedToCore(streamTask, "streamTask", 8192, NULL, 1, NULL, 0);
+  Serial.println("✅ Stream task Core 0 port 81");
+  Serial.println("   Open: http://192.168.4.1");
+  Serial.println("================");
+}
+
+// ========== LOOP — Core 1 ==========
+void loop() {
+  controlServer.handleClient();
+
+  // ✅ No auto-off — flash stays where user set it
+
+  // Debounced button
+  bool reading = digitalRead(BUTTON_PIN);
+  if (reading != lastButtonState) lastDebounceTime = millis();
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (reading != stableButtonState) {
+      stableButtonState = reading;
+      if (stableButtonState == LOW) {
+        buttonPressed    = true;
+        captureRequested = true;
+        Serial.println("Button pressed — capture flagged");
+      } else {
+        buttonPressed = false;
+        Serial.println("Button released");
+      }
+    }
+  }
+  lastButtonState = reading;
+}
